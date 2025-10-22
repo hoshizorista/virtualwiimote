@@ -74,7 +74,13 @@ Right now you get a **software IR pointer** plus **twirl/spin** “shake” moti
    - This app intentionally uses **26761** (not the common 26760) to avoid conflicts.  
 6. In the dropdown, select **Controller #1**.  
 7. Enable **MotionPlus** and **Motion** (one checkbox in the DSU panel, the other in DSU **Settings**).
+8. IMPORTANT: **BIND AGAIN ALL BUTTONS IN CEMU, literally just copy the bindings of the WiiMote default buttons that you have in the app to CEMU (except motion buttons, only WiiMote default buttons like A, B, + -, 1 & 2)**
+   
+When you configure your buttons inside Virtual WiiMote, those mappings exist only inside the DSU server (the app) — Cemu doesn’t automatically “see” what keys or buttons you assigned there.
+The DSU protocol just tells Cemu “a Wiimote button was pressed”, but not which physical key or controller button triggered it.
 
+That’s why after you finish setting up the Virtual WiiMote app, you still have to open Cemu’s Input Settings and bind those same WiiMote buttons again, so that Cemu knows what to expect.
+   
 **Screenshots**
 
 ![Cemu DSU Setup](https://i.ibb.co/tTGK13JN/Screenshot-2025-10-22-005409.png)  
