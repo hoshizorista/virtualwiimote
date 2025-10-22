@@ -1,4 +1,4 @@
-# dsu_mouse_ir_keys_spin_gui_v3_wiimote_en.py
+# Virtual WiiMote — DSU server (Cemuhook) + DearPyGui
 
 import socket, struct, time, random, zlib, select, threading, json, os
 from collections import deque
@@ -28,14 +28,17 @@ DEFAULTS = {
     "cursor_speed_px_s": 1600.0,          # px/sec at full deflection
     "stick_deadzone": 8000,               # 0..32767
 
-    # Spins/pulses
-    "twirl_z_dps": 800.0,   # W
-    "spin_x_dps":  800.0,   # E
+    # Spins/pulses (shake)
+    "twirl_z_dps": 800.0,                 # W — spin around Z (twirl)
+    "spin_x_dps":  800.0,                 # E — spin around X
     "w_pulse_ax": 38.0,
     "e_pulse_ay": 40.0,
     "pulse_az":   36.0,
     "pulse_ms":   64,
     "cooldown_ms": 20,
+
+    # NEW: Twist (gyro-only) speed while holding twist keys
+    "twist_dps":   180.0,                 # deg/s applied when holding front/back/left/right twist
 
     # Synthetic LS magnitude for D-Pad mapping
     "lstick_magnitude": 255,
@@ -48,7 +51,8 @@ DEFAULTS = {
 BIND_VK   = "VK"
 BIND_XBTN = "XBTN"
 
-# Default bindings (Wiimote-style)
+# Default bindings (Wiimote-style + Twist)
+# NOTE: VK codes: ';' is VK_OEM_1 (0xBA) on most US layouts.
 DEFAULT_BINDINGS = {
     # Wiimote
     "wm_a":           (BIND_VK, ord('A')),
@@ -62,10 +66,17 @@ DEFAULT_BINDINGS = {
     "wm_dpad_right":  (BIND_VK, 0x27),
     "wm_dpad_up":     (BIND_VK, 0x26),
     "wm_dpad_down":   (BIND_VK, 0x28),
-    # Extra
+
+    # Extra shake/toggle
     "spin_w":         (BIND_VK, ord('W')),
     "spin_e":         (BIND_VK, ord('E')),
     "toggle_off":     (BIND_VK, 0x77),        # F8
+
+    # NEW: Twist (Front/Back/Left/Right)
+    "mv_front":       (BIND_VK, ord('O')),    # pitch forward
+    "mv_back":        (BIND_VK, ord('L')),    # pitch backward
+    "mv_left":        (BIND_VK, ord('K')),    # roll left
+    "mv_right":       (BIND_VK, 0xBA),        # roll right (';')
 }
 
 # Wiimote actions (for tables)
@@ -87,6 +98,13 @@ ACTIONS_EXTRA = [
     ("spin_e",         "Shake/Spin  X (E)"),
     ("toggle_off",     "Toggle Offscreen"),
 ]
+# NEW: Twist bindings (independent of D-Pad; these drive gyro only)
+ACTIONS_TWIST = [
+    ("mv_front",       "Twist Front (pitch forward)"),
+    ("mv_back",        "Twist Back (pitch backward)"),
+    ("mv_left",        "Twist Left (roll left)"),
+    ("mv_right",       "Twist Right (roll right)"),
+]
 
 # ------------------------------ Win32 / XInput ------------------------------
 
@@ -101,7 +119,8 @@ VK_NAME = {
     0xA0:"LSHIFT", 0xA2:"LCTRL", 0xA4:"LALT",
     0x70:"F1",0x71:"F2",0x72:"F3",0x73:"F4",0x74:"F5",0x75:"F6",
     0x76:"F7",0x77:"F8",0x78:"F9",0x79:"F10",0x7A:"F11",0x7B:"F12",
-    0xBB:"OEM_PLUS", 0xBD:"OEM_MINUS",
+    0xBB:"OEM_PLUS(+)", 0xBD:"OEM_MINUS(-)",
+    0xBA:"OEM_1(;)",    # shows as ';' on US layout
 }
 for c in range(ord('0'), ord('9')+1):
     VK_NAME[c] = chr(c)
@@ -210,7 +229,7 @@ class Config:
         except Exception as e:
             log(f"Error saving config: {e}")
 
-    # --- NEW: bindings-only save/load ---
+    # --- bindings-only save/load ---
     def save_bindings_only(self, path:str):
         try:
             with self.lock:
@@ -237,21 +256,19 @@ class Config:
         except Exception as e:
             log(f"Error loading bindings: {e}")
 
-    # --- NEW: reset to defaults (and reset config JSON) ---
+    # --- reset to defaults (and reset config JSON) ---
     def reset_to_defaults(self, delete_config_file=True):
         with self.lock:
             self.values = dict(DEFAULTS)
             self.bindings = dict(DEFAULT_BINDINGS)
             self.rebind_target = None
             self.rebind_deadline = 0.0
-        # remove config file if requested
         if delete_config_file and os.path.isfile(CONFIG_FILE):
             try:
                 os.remove(CONFIG_FILE)
                 log("Deleted existing config file.")
             except Exception as e:
                 log(f"Could not delete config file: {e}")
-        # write a fresh default config
         self.save(CONFIG_FILE)
         log("Reset to defaults completed.")
 
@@ -372,15 +389,12 @@ def resp_data(st: State):
         binds = dict(config.bindings)
 
     hz = max(1, int(vals["hz"]))
-    pulse_frames   = frames_for_ms(vals["pulse_ms"], hz)
-    pulse_cooldown = frames_for_ms(vals["cooldown_ms"], hz)
     smooth = float(vals["smooth"])
 
     st.idx += 1
-
     xi = xinput_get_state(0)
 
-    # ----- Pointer (touch)
+    # ----- Pointer (touch) -----
     tpad_w = int(vals["tpad_w"]); tpad_h = int(vals["tpad_h"])
     pointer_source = vals.get("pointer_source","mouse")
 
@@ -411,9 +425,7 @@ def resp_data(st: State):
         move_x = nx * px
         move_y = -ny * px  # up is negative
         if st.tx_prev is None:
-            tx_seed = tpad_w // 2
-            ty_seed = tpad_h // 2
-            st.tx_prev, st.ty_prev = tx_seed, ty_seed
+            st.tx_prev, st.ty_prev = tpad_w // 2, tpad_h // 2
         tx_raw = int(max(0, min(tpad_w-1, (st.tx_prev if st.tx_prev is not None else 0) + move_x)))
         ty_raw = int(max(0, min(tpad_h-1, (st.ty_prev if st.ty_prev is not None else 0) + move_y)))
 
@@ -424,7 +436,7 @@ def resp_data(st: State):
         ty = int(st.ty_prev + smooth*(ty_raw - st.ty_prev))
     st.tx_prev, st.ty_prev = tx, ty
 
-    # ----- Wiimote mapping -> DS4 bits
+    # ----- Wiimote mapping -> DS4 bits -----
     face = 0
     ps = 0
 
@@ -455,10 +467,11 @@ def resp_data(st: State):
     if is_binding_down(binds.get("wm_dpad_up"), xi):    ly = 128 - mag//2
     if is_binding_down(binds.get("wm_dpad_down"), xi):  ly = 128 + mag//2
 
-    # ----- Shake/spins (W/E)
+    # ----- Shake/spins (W/E) with adjustable speeds -----
     w_down = is_binding_down(binds.get("spin_w"), xi)
     e_down = is_binding_down(binds.get("spin_e"), xi)
 
+    # pulse bookkeeping
     if not hasattr(st, "prev_w"): st.prev_w = False
     if not hasattr(st, "prev_e"): st.prev_e = False
     if not hasattr(st, "dir_w"):  st.dir_w = 1.0
@@ -499,6 +512,7 @@ def resp_data(st: State):
     else:
         st.e_pulse_left = 0; st.e_cooldown = 0
 
+    # base accel/gyro
     ax = 0.0; ay = 0.0; az = G
     if st.w_pulse_left > 0:
         ax += st.dir_w * float(vals["w_pulse_ax"])
@@ -512,6 +526,17 @@ def resp_data(st: State):
     gx = (st.dir_e * float(vals["spin_x_dps"])) if e_down else 0.0
     gy = 0.0
     gz = (st.dir_w * float(vals["twirl_z_dps"])) if w_down else 0.0
+
+    # ----- NEW: Twist keys (gyro-only, no linear accel) -----
+    twist = float(vals["twist_dps"])
+    if is_binding_down(binds.get("mv_front"), xi):
+        gx += twist      # pitch forward
+    if is_binding_down(binds.get("mv_back"), xi):
+        gx -= twist      # pitch backward
+    if is_binding_down(binds.get("mv_left"), xi):
+        gy -= twist      # roll left
+    if is_binding_down(binds.get("mv_right"), xi):
+        gy += twist      # roll right
 
     ts_us = time.perf_counter_ns() // 1000
 
@@ -626,13 +651,13 @@ def server_thread():
 
 # ------------------------------ GUI (DearPyGui) ------------------------------
 
-# UI tags we need to update after reset/load
 IDS = {
     "log_child": "log_child",
     "subs_text": "subs_text",
     "host_text": "host_text",
     "port_text": "port_text",
     "ptr_combo": "ptr_combo",
+
     # controls we want to sync on reset
     "hz_slider": "hz_slider",
     "invert_y": "invert_y",
@@ -643,11 +668,21 @@ IDS = {
     "tpad_h": "tpad_h",
     "lstick_mag": "lstick_mag",
     "bindings_file": "bindings_file",
+
+    # Motion/Shake/Twist tuning sliders (sync too)
+    "twirl_z_dps": "twirl_z_dps",
+    "spin_x_dps": "spin_x_dps",
+    "w_pulse_ax": "w_pulse_ax",
+    "e_pulse_ay": "e_pulse_ay",
+    "pulse_az": "pulse_az",
+    "pulse_ms": "pulse_ms",
+    "cooldown_ms": "cooldown_ms",
+    "twist_dps": "twist_dps",
 }
 
 BIND_LABEL_TAG = {}
 REBIND_BTN_TAG  = {}
-for key,_ in ACTIONS_WIIMOTE + ACTIONS_EXTRA:
+for key,_ in ACTIONS_WIIMOTE + ACTIONS_EXTRA + ACTIONS_TWIST:
     BIND_LABEL_TAG[key] = f"bind_label_{key}"
     REBIND_BTN_TAG[key] = f"rebind_btn_{key}"
 
@@ -706,10 +741,17 @@ def sync_controls_from_config():
         dpg.set_value(IDS["lstick_mag"],          config.values["lstick_magnitude"])
         dpg.set_value(IDS["bindings_file"],       config.values["bindings_filename"])
 
+        dpg.set_value(IDS["twirl_z_dps"],         config.values["twirl_z_dps"])
+        dpg.set_value(IDS["spin_x_dps"],          config.values["spin_x_dps"])
+        dpg.set_value(IDS["w_pulse_ax"],          config.values["w_pulse_ax"])
+        dpg.set_value(IDS["e_pulse_ay"],          config.values["e_pulse_ay"])
+        dpg.set_value(IDS["pulse_az"],            config.values["pulse_az"])
+        dpg.set_value(IDS["pulse_ms"],            config.values["pulse_ms"])
+        dpg.set_value(IDS["cooldown_ms"],         config.values["cooldown_ms"])
+        dpg.set_value(IDS["twist_dps"],           config.values["twist_dps"])
+
 def on_reset_defaults(sender, app_data, user_data):
-    # Reset runtime + config file
     config.reset_to_defaults(delete_config_file=True)
-    # Refresh UI controls
     sync_controls_from_config()
     log("All values and bindings reset to defaults.")
 
@@ -729,10 +771,10 @@ def build_bind_table(title, actions):
 
 def build_gui():
     dpg.create_context()
-    dpg.create_viewport(title=APP_TITLE, width=1040, height=820)
+    dpg.create_viewport(title=APP_TITLE, width=1100, height=930)
     dpg.setup_dearpygui()
 
-    with dpg.window(label=APP_TITLE, tag="main", width=1020, height=790, no_collapse=True):
+    with dpg.window(label=APP_TITLE, tag="main", width=1080, height=900, no_collapse=True):
         dpg.add_text("Server status")
         dpg.add_separator()
         with dpg.group(horizontal=True):
@@ -761,12 +803,32 @@ def build_gui():
 
         dpg.add_separator()
         build_bind_table("Bindings — Wiimote", ACTIONS_WIIMOTE)
+
         dpg.add_separator()
         with dpg.group(horizontal=True):
             dpg.add_slider_int(label="D-Pad (LS) Magnitude", default_value=config.values["lstick_magnitude"], min_value=0, max_value=255, width=300, callback=on_slider_change, user_data="lstick_magnitude", tag=IDS["lstick_mag"])
 
         dpg.add_separator()
         build_bind_table("Bindings — Extra (Shake/Toggle)", ACTIONS_EXTRA)
+
+        dpg.add_separator()
+        # NEW: Twist bindings section (independent of D-Pad; gyro-only)
+        build_bind_table("Bindings — Twist (hold to twist controller)", ACTIONS_TWIST)
+
+        dpg.add_separator()
+        dpg.add_text("Motion / Shake / Twist Tuning")
+        with dpg.group(horizontal=True):
+            dpg.add_slider_float(label="Twirl Z speed (deg/s)", default_value=config.values["twirl_z_dps"], min_value=0.0, max_value=2000.0, width=280, callback=on_slider_change, user_data="twirl_z_dps", tag=IDS["twirl_z_dps"])
+            dpg.add_slider_float(label="Spin X speed (deg/s)",  default_value=config.values["spin_x_dps"],  min_value=0.0, max_value=2000.0, width=280, callback=on_slider_change, user_data="spin_x_dps",  tag=IDS["spin_x_dps"])
+        with dpg.group(horizontal=True):
+            dpg.add_slider_float(label="Pulse AX (m/s²)", default_value=config.values["w_pulse_ax"], min_value=0.0, max_value=100.0, width=220, callback=on_slider_change, user_data="w_pulse_ax", tag=IDS["w_pulse_ax"])
+            dpg.add_slider_float(label="Pulse AY (m/s²)", default_value=config.values["e_pulse_ay"], min_value=0.0, max_value=100.0, width=220, callback=on_slider_change, user_data="e_pulse_ay", tag=IDS["e_pulse_ay"])
+            dpg.add_slider_float(label="Pulse AZ (m/s²)", default_value=config.values["pulse_az"],  min_value=0.0, max_value=100.0, width=220, callback=on_slider_change, user_data="pulse_az",  tag=IDS["pulse_az"])
+        with dpg.group(horizontal=True):
+            dpg.add_slider_int(label="Pulse ms", default_value=config.values["pulse_ms"], min_value=4, max_value=200, width=200, callback=on_slider_change, user_data="pulse_ms", tag=IDS["pulse_ms"])
+            dpg.add_slider_int(label="Cooldown ms", default_value=config.values["cooldown_ms"], min_value=0, max_value=200, width=220, callback=on_slider_change, user_data="cooldown_ms", tag=IDS["cooldown_ms"])
+        with dpg.group(horizontal=True):
+            dpg.add_slider_float(label="Twist rate (deg/s)",  default_value=config.values["twist_dps"],   min_value=0.0, max_value=720.0, width=260, callback=on_slider_change, user_data="twist_dps",  tag=IDS["twist_dps"])
 
         dpg.add_separator()
         dpg.add_text("Config & Bindings")
@@ -797,7 +859,7 @@ def gui_mainloop():
 
         # update binding labels & subs count
         with config.lock:
-            for k,_ in ACTIONS_WIIMOTE + ACTIONS_EXTRA:
+            for k,_ in ACTIONS_WIIMOTE + ACTIONS_EXTRA + ACTIONS_TWIST:
                 name = binding_name(config.bindings.get(k))
                 if config.rebind_target == k:
                     name = f"{name}  (waiting...)"
