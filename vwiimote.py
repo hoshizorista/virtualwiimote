@@ -1,10 +1,4 @@
-# dsu_mouse_ir_keys_spin_gui_v2_wiimote_en.py
-# DSU server (Cemuhook) + DearPyGui
-# - Pointer: Mouse or Stick (LS/RS) with speed/deadzone
-# - Full Wiimote-style mapping (A, B, 1, 2, +, −, Home, D-Pad) — fully remappable
-# - Shake/spins (W/E) remappable
-# - Low CPU (select + scheduler + timeBeginPeriod)
-# - JSON config save/load
+# dsu_mouse_ir_keys_spin_gui_v3_wiimote_en.py
 
 import socket, struct, time, random, zlib, select, threading, json, os
 from collections import deque
@@ -13,8 +7,9 @@ from ctypes import wintypes
 
 import dearpygui.dearpygui as dpg
 
-# ------------------------------ CONFIG & SHARED STATE ------------------------------
+# ------------------------------ CONFIG & CONSTANTS ------------------------------
 
+APP_TITLE = "Virtual WiiMote"
 CONFIG_FILE = "dsu_gui_config.json"
 
 HOST = "127.0.0.1"
@@ -43,10 +38,37 @@ DEFAULTS = {
     "cooldown_ms": 20,
 
     # Synthetic LS magnitude for D-Pad mapping
-    "lstick_magnitude": 255
+    "lstick_magnitude": 255,
+
+    # UI helpers (not saved to bindings-only files)
+    "bindings_filename": "bindings_user.json",
 }
 
-# Wiimote actions → mapped to DSU/DS4 bits or LS synth
+# Binding types
+BIND_VK   = "VK"
+BIND_XBTN = "XBTN"
+
+# Default bindings (Wiimote-style)
+DEFAULT_BINDINGS = {
+    # Wiimote
+    "wm_a":           (BIND_VK, ord('A')),
+    "wm_b":           (BIND_VK, ord('S')),
+    "wm_1":           (BIND_VK, ord('1')),
+    "wm_2":           (BIND_VK, ord('2')),
+    "wm_plus":        (BIND_VK, 0xBB),        # OEM_PLUS '+'
+    "wm_minus":       (BIND_VK, 0xBD),        # OEM_MINUS '-'
+    "wm_home":        (BIND_VK, 0x24),        # HOME
+    "wm_dpad_left":   (BIND_VK, 0x25),
+    "wm_dpad_right":  (BIND_VK, 0x27),
+    "wm_dpad_up":     (BIND_VK, 0x26),
+    "wm_dpad_down":   (BIND_VK, 0x28),
+    # Extra
+    "spin_w":         (BIND_VK, ord('W')),
+    "spin_e":         (BIND_VK, ord('E')),
+    "toggle_off":     (BIND_VK, 0x77),        # F8
+}
+
+# Wiimote actions (for tables)
 ACTIONS_WIIMOTE = [
     ("wm_a",           "Wiimote A"),
     ("wm_b",           "Wiimote B (Trigger)"),
@@ -60,37 +82,36 @@ ACTIONS_WIIMOTE = [
     ("wm_dpad_up",     "Wiimote D-Pad UP"),
     ("wm_dpad_down",   "Wiimote D-Pad DOWN"),
 ]
-
-# Extra actions (shake/toggle)
 ACTIONS_EXTRA = [
     ("spin_w",         "Shake/Twirl Z (W)"),
     ("spin_e",         "Shake/Spin  X (E)"),
     ("toggle_off",     "Toggle Offscreen"),
 ]
 
-# Binding types
-BIND_VK   = "VK"
-BIND_XBTN = "XBTN"
+# ------------------------------ Win32 / XInput ------------------------------
 
-# Win32 / XInput
 user32 = windll.user32
 winmm  = windll.winmm
 GetAsyncKeyState = user32.GetAsyncKeyState
 
-VK = {k: ord(k) for k in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"}
-VK.update({
-    "F1":0x70,"F2":0x71,"F3":0x72,"F4":0x73,"F5":0x74,"F6":0x75,"F7":0x76,"F8":0x77,"F9":0x78,"F10":0x79,"F11":0x7A,"F12":0x7B,
-    "LEFT":0x25, "UP":0x26, "RIGHT":0x27, "DOWN":0x28,
-    "SPACE":0x20, "TAB":0x09, "ESC":0x1B, "ENTER":0x0D, "LSHIFT":0xA0, "LCTRL":0xA2, "LALT":0xA4,
-    "HOME":0x24,
-    "OEM_PLUS":0xBB,   # '+'
-    "OEM_MINUS":0xBD,  # '-'
-})
+# VK names table (partial)
+VK_NAME = {
+    0x24:"HOME", 0x25:"LEFT", 0x26:"UP", 0x27:"RIGHT", 0x28:"DOWN",
+    0x20:"SPACE", 0x09:"TAB", 0x1B:"ESC", 0x0D:"ENTER",
+    0xA0:"LSHIFT", 0xA2:"LCTRL", 0xA4:"LALT",
+    0x70:"F1",0x71:"F2",0x72:"F3",0x73:"F4",0x74:"F5",0x75:"F6",
+    0x76:"F7",0x77:"F8",0x78:"F9",0x79:"F10",0x7A:"F11",0x7B:"F12",
+    0xBB:"OEM_PLUS", 0xBD:"OEM_MINUS",
+}
+for c in range(ord('0'), ord('9')+1):
+    VK_NAME[c] = chr(c)
+for c in range(ord('A'), ord('Z')+1):
+    VK_NAME[c] = chr(c)
 
-VK_NAME = {code:name for name,code in VK.items()}
 def vk_to_name(code:int)->str:
     return VK_NAME.get(code, f"VK_{code}")
 
+# XInput
 try:
     _xinput = windll.xinput1_4
 except OSError:
@@ -144,43 +165,25 @@ def mouse_pos():
     user32.GetCursorPos(byref(p))
     return p.x, p.y
 
-# ------------------------------ LOG/UTILS ------------------------------
+# ------------------------------ LOG ------------------------------
 
 log_queue = deque(maxlen=500)
 def log(msg:str):
     ts = time.strftime("%H:%M:%S")
     log_queue.append(f"[{ts}] {msg}")
-    print(f"[GUI] {msg}")
+    print(f"[{APP_TITLE}] {msg}")
 
-# ------------------------------ RUNTIME CONFIG ------------------------------
+# ------------------------------ CONFIG RUNTIME ------------------------------
 
 class Config:
     def __init__(self):
         self.lock = threading.Lock()
         self.values = dict(DEFAULTS)
-        # Defaults: keyboard + arrows; shake W/E; toggle F8
-        self.bindings = {
-            # Wiimote
-            "wm_a":           (BIND_VK, VK["A"]),
-            "wm_b":           (BIND_VK, VK["S"]),
-            "wm_1":           (BIND_VK, ord('1')),
-            "wm_2":           (BIND_VK, ord('2')),
-            "wm_plus":        (BIND_VK, VK["OEM_PLUS"]),
-            "wm_minus":       (BIND_VK, VK["OEM_MINUS"]),
-            "wm_home":        (BIND_VK, VK["HOME"]),
-            "wm_dpad_left":   (BIND_VK, VK["LEFT"]),
-            "wm_dpad_right":  (BIND_VK, VK["RIGHT"]),
-            "wm_dpad_up":     (BIND_VK, VK["UP"]),
-            "wm_dpad_down":   (BIND_VK, VK["DOWN"]),
-
-            # Extra
-            "spin_w":         (BIND_VK, ord('W')),
-            "spin_e":         (BIND_VK, ord('E')),
-            "toggle_off":     (BIND_VK, VK["F8"]),
-        }
+        self.bindings = dict(DEFAULT_BINDINGS)
         self.rebind_target = None
         self.rebind_deadline = 0.0
         self.want_stop = False
+        self.subs_count = 0  # for UI
 
     def load(self, path=CONFIG_FILE):
         if not os.path.isfile(path): return
@@ -206,6 +209,51 @@ class Config:
             log("Config saved.")
         except Exception as e:
             log(f"Error saving config: {e}")
+
+    # --- NEW: bindings-only save/load ---
+    def save_bindings_only(self, path:str):
+        try:
+            with self.lock:
+                data = {"bindings": self.bindings}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            log(f"Bindings saved to '{path}'.")
+        except Exception as e:
+            log(f"Error saving bindings: {e}")
+
+    def load_bindings_only(self, path:str):
+        try:
+            if not os.path.isfile(path):
+                log(f"Bindings file not found: '{path}'")
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            loaded = data.get("bindings", {})
+            with self.lock:
+                for k,v in loaded.items():
+                    if isinstance(v, list) and len(v)==2:
+                        self.bindings[k] = (v[0], int(v[1]))
+            log(f"Bindings loaded from '{path}'.")
+        except Exception as e:
+            log(f"Error loading bindings: {e}")
+
+    # --- NEW: reset to defaults (and reset config JSON) ---
+    def reset_to_defaults(self, delete_config_file=True):
+        with self.lock:
+            self.values = dict(DEFAULTS)
+            self.bindings = dict(DEFAULT_BINDINGS)
+            self.rebind_target = None
+            self.rebind_deadline = 0.0
+        # remove config file if requested
+        if delete_config_file and os.path.isfile(CONFIG_FILE):
+            try:
+                os.remove(CONFIG_FILE)
+                log("Deleted existing config file.")
+            except Exception as e:
+                log(f"Could not delete config file: {e}")
+        # write a fresh default config
+        self.save(CONFIG_FILE)
+        log("Reset to defaults completed.")
 
     def begin_rebind(self, action:str, seconds=5):
         with self.lock:
@@ -302,7 +350,7 @@ class State:
     __slots__ = ("idx","tx_prev","ty_prev","offscreen",
                  "prev_w","prev_e","dir_w","dir_e",
                  "w_pulse_left","e_pulse_left","w_cooldown","e_cooldown",
-                 "last_toggle_us","subs_count")
+                 "last_toggle_us")
     def __init__(self):
         self.idx = 0
         self.tx_prev = None
@@ -317,7 +365,6 @@ class State:
         self.w_cooldown = 0
         self.e_cooldown = 0
         self.last_toggle_us = 0
-        self.subs_count = 0
 
 def resp_data(st: State):
     with config.lock:
@@ -556,7 +603,8 @@ def server_thread():
                         if addr not in subs:
                             subs.add(addr)
                             log(f"Subscriber: {addr[0]}:{addr[1]}")
-                        st.subs_count = len(subs)
+                        with config.lock:
+                            config.subs_count = len(subs)
 
             now = time.perf_counter()
             if now >= next_tick:
@@ -567,7 +615,8 @@ def server_thread():
                             s.sendto(pkt, a)
                         except OSError:
                             subs.discard(a)
-                    st.subs_count = len(subs)
+                    with config.lock:
+                        config.subs_count = len(subs)
                 missed = int((now - next_tick) / period)
                 next_tick += (missed + 1) * period
     finally:
@@ -577,12 +626,23 @@ def server_thread():
 
 # ------------------------------ GUI (DearPyGui) ------------------------------
 
+# UI tags we need to update after reset/load
 IDS = {
     "log_child": "log_child",
     "subs_text": "subs_text",
     "host_text": "host_text",
     "port_text": "port_text",
     "ptr_combo": "ptr_combo",
+    # controls we want to sync on reset
+    "hz_slider": "hz_slider",
+    "invert_y": "invert_y",
+    "smooth_slider": "smooth_slider",
+    "cursor_speed": "cursor_speed",
+    "deadzone": "deadzone",
+    "tpad_w": "tpad_w",
+    "tpad_h": "tpad_h",
+    "lstick_mag": "lstick_mag",
+    "bindings_file": "bindings_file",
 }
 
 BIND_LABEL_TAG = {}
@@ -606,13 +666,52 @@ def on_combo(sender, app_data, user_data):
     with config.lock:
         config.values[key] = str(app_data)
 
+def on_input_text(sender, app_data, user_data):
+    key = user_data
+    with config.lock:
+        config.values[key] = str(app_data)
+
 def on_click_rebind(sender, app_data, user_data):
     action = user_data
     config.begin_rebind(action)
     log(f"Rebind '{action}' started: press any key or XInput button...")
 
-def on_save(sender, app_data, user_data):
+def on_save_config(sender, app_data, user_data):
     config.save()
+
+def on_save_bindings(sender, app_data, user_data):
+    with config.lock:
+        fn = config.values.get("bindings_filename", "bindings_user.json")
+    if not fn.lower().endswith(".json"):
+        fn += ".json"
+    config.save_bindings_only(fn)
+
+def on_load_bindings(sender, app_data, user_data):
+    with config.lock:
+        fn = config.values.get("bindings_filename", "bindings_user.json")
+    if not fn.lower().endswith(".json"):
+        fn += ".json"
+    config.load_bindings_only(fn)
+
+def sync_controls_from_config():
+    with config.lock:
+        dpg.set_value(IDS["hz_slider"],           config.values["hz"])
+        dpg.set_value(IDS["invert_y"],            config.values["invert_y"])
+        dpg.set_value(IDS["smooth_slider"],       config.values["smooth"])
+        dpg.set_value(IDS["ptr_combo"],           config.values["pointer_source"])
+        dpg.set_value(IDS["cursor_speed"],        config.values["cursor_speed_px_s"])
+        dpg.set_value(IDS["deadzone"],            config.values["stick_deadzone"])
+        dpg.set_value(IDS["tpad_w"],              config.values["tpad_w"])
+        dpg.set_value(IDS["tpad_h"],              config.values["tpad_h"])
+        dpg.set_value(IDS["lstick_mag"],          config.values["lstick_magnitude"])
+        dpg.set_value(IDS["bindings_file"],       config.values["bindings_filename"])
+
+def on_reset_defaults(sender, app_data, user_data):
+    # Reset runtime + config file
+    config.reset_to_defaults(delete_config_file=True)
+    # Refresh UI controls
+    sync_controls_from_config()
+    log("All values and bindings reset to defaults.")
 
 def build_bind_table(title, actions):
     dpg.add_text(title)
@@ -630,10 +729,10 @@ def build_bind_table(title, actions):
 
 def build_gui():
     dpg.create_context()
-    dpg.create_viewport(title="Virtual WiiMote", width=1000, height=760)
+    dpg.create_viewport(title=APP_TITLE, width=1040, height=820)
     dpg.setup_dearpygui()
 
-    with dpg.window(label="Virtual WiiMote", tag="main", width=980, height=730, no_collapse=True):
+    with dpg.window(label=APP_TITLE, tag="main", width=1020, height=790, no_collapse=True):
         dpg.add_text("Server status")
         dpg.add_separator()
         with dpg.group(horizontal=True):
@@ -646,34 +745,42 @@ def build_gui():
         dpg.add_separator()
         dpg.add_text("Live parameters")
         with dpg.group(horizontal=True):
-            dpg.add_slider_int(label="HZ", default_value=config.values["hz"], min_value=60, max_value=250, width=220, callback=on_slider_change, user_data="hz")
-            dpg.add_checkbox(label="Invert Y", default_value=config.values["invert_y"], callback=on_checkbox, user_data="invert_y")
-            dpg.add_slider_float(label="Smoothing", default_value=config.values["smooth"], min_value=0.0, max_value=1.0, width=220, callback=on_slider_change, user_data="smooth")
+            dpg.add_slider_int(label="HZ", default_value=config.values["hz"], min_value=60, max_value=250, width=220, callback=on_slider_change, user_data="hz", tag=IDS["hz_slider"])
+            dpg.add_checkbox(label="Invert Y", default_value=config.values["invert_y"], callback=on_checkbox, user_data="invert_y", tag=IDS["invert_y"])
+            dpg.add_slider_float(label="Smoothing", default_value=config.values["smooth"], min_value=0.0, max_value=1.0, width=220, callback=on_slider_change, user_data="smooth", tag=IDS["smooth_slider"])
         dpg.add_separator()
 
         dpg.add_text("Pointer (IR) — Source & dynamics")
         with dpg.group(horizontal=True):
             dpg.add_combo(POINTER_SOURCES, default_value=config.values["pointer_source"], width=160, callback=on_combo, user_data="pointer_source", tag=IDS["ptr_combo"])
-            dpg.add_slider_float(label="Cursor speed (px/s)", default_value=config.values["cursor_speed_px_s"], min_value=100.0, max_value=4000.0, width=300, callback=on_slider_change, user_data="cursor_speed_px_s")
-            dpg.add_slider_int(label="Stick deadzone", default_value=config.values["stick_deadzone"], min_value=0, max_value=20000, width=240, callback=on_slider_change, user_data="stick_deadzone")
+            dpg.add_slider_float(label="Cursor speed (px/s)", default_value=config.values["cursor_speed_px_s"], min_value=100.0, max_value=4000.0, width=300, callback=on_slider_change, user_data="cursor_speed_px_s", tag=IDS["cursor_speed"])
+            dpg.add_slider_int(label="Stick deadzone", default_value=config.values["stick_deadzone"], min_value=0, max_value=20000, width=240, callback=on_slider_change, user_data="stick_deadzone", tag=IDS["deadzone"])
         with dpg.group(horizontal=True):
-            dpg.add_slider_int(label="Touchpad W", default_value=config.values["tpad_w"], min_value=320, max_value=4096, width=240, callback=on_slider_change, user_data="tpad_w")
-            dpg.add_slider_int(label="Touchpad H", default_value=config.values["tpad_h"], min_value=240, max_value=2048, width=240, callback=on_slider_change, user_data="tpad_h")
+            dpg.add_slider_int(label="Touchpad W", default_value=config.values["tpad_w"], min_value=320, max_value=4096, width=240, callback=on_slider_change, user_data="tpad_w", tag=IDS["tpad_w"])
+            dpg.add_slider_int(label="Touchpad H", default_value=config.values["tpad_h"], min_value=240, max_value=2048, width=240, callback=on_slider_change, user_data="tpad_h", tag=IDS["tpad_h"])
 
         dpg.add_separator()
         build_bind_table("Bindings — Wiimote", ACTIONS_WIIMOTE)
         dpg.add_separator()
         with dpg.group(horizontal=True):
-            dpg.add_slider_int(label="D-Pad (LS) Magnitude", default_value=config.values["lstick_magnitude"], min_value=0, max_value=255, width=300, callback=on_slider_change, user_data="lstick_magnitude")
+            dpg.add_slider_int(label="D-Pad (LS) Magnitude", default_value=config.values["lstick_magnitude"], min_value=0, max_value=255, width=300, callback=on_slider_change, user_data="lstick_magnitude", tag=IDS["lstick_mag"])
 
         dpg.add_separator()
         build_bind_table("Bindings — Extra (Shake/Toggle)", ACTIONS_EXTRA)
 
         dpg.add_separator()
+        dpg.add_text("Config & Bindings")
         with dpg.group(horizontal=True):
-            dpg.add_button(label="Save Config", callback=on_save)
-            dpg.add_text("Log:")
-        dpg.add_child_window(tag=IDS["log_child"], height=220, autosize_x=True, horizontal_scrollbar=True)
+            dpg.add_button(label="Save Config", callback=on_save_config)
+            dpg.add_button(label="Reset to Defaults", callback=on_reset_defaults)
+        with dpg.group(horizontal=True):
+            dpg.add_input_text(label="Bindings file (.json)", default_value=config.values["bindings_filename"], width=260, callback=on_input_text, user_data="bindings_filename", tag=IDS["bindings_file"])
+            dpg.add_button(label="Save Bindings (.json)", callback=on_save_bindings)
+            dpg.add_button(label="Load Bindings (.json)", callback=on_load_bindings)
+
+        dpg.add_separator()
+        dpg.add_text("Log:")
+        dpg.add_child_window(tag=IDS["log_child"], height=240, autosize_x=True, horizontal_scrollbar=True)
 
     dpg.set_primary_window("main", True)
     dpg.show_viewport()
@@ -682,18 +789,21 @@ def gui_mainloop():
     th = threading.Thread(target=server_thread, daemon=True)
     th.start()
     while dpg.is_dearpygui_running():
+        # flush logs
         while log_queue:
             line = log_queue.popleft()
             dpg.add_text(line, parent=IDS["log_child"])
             dpg.set_y_scroll(IDS["log_child"], 1e9)
 
-        # Update binding labels (show "...waiting" during rebind)
+        # update binding labels & subs count
         with config.lock:
             for k,_ in ACTIONS_WIIMOTE + ACTIONS_EXTRA:
                 name = binding_name(config.bindings.get(k))
                 if config.rebind_target == k:
                     name = f"{name}  (waiting...)"
                 dpg.set_value(BIND_LABEL_TAG[k], name)
+            dpg.set_value(IDS["subs_text"], str(config.subs_count))
+
         dpg.render_dearpygui_frame()
         time.sleep(0.01)
 
