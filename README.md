@@ -140,4 +140,4 @@ Early but working. Expect the odd bug. I’m releasing this because I’m **fina
 
 ## License
 
-Pick a license (MIT recommended) and include a `LICENSE` file.
+MIT
