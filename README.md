@@ -4,6 +4,9 @@
 
 ▶️ [Watch the tutorial](https://youtu.be/2EJzKAlKOfM?t=16s)
 
+[<img src="https://i.imgur.com/8dQpVxG.png" width="560" alt="Watch the video">](https://youtu.be/2EJzKAlKOfM?t=16s)
+
+
 
 Turn **anything**—mouse, keyboard, or Xbox/DirectInput pad—into a **virtual Wiimote** for **Cemu**, complete with a **software IR (infrared) pointer**.  
 No phone, no Bluetooth, no real Wiimote required.
